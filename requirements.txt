@@ -1,6 +1,7 @@
 torch
 transformers
 streamlit
+streamlit-autorefresh
 obspy
 matplotlib
 numpy

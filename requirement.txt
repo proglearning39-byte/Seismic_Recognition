@@ -1,0 +1,7 @@
+torch>=2.0.0
+numpy>=1.22.0
+obspy>=1.4.0
+scipy>=1.8.0
+streamlit>=1.28.0
+streamlit-autorefresh>=0.0.1
+matplotlib>=3.5.0

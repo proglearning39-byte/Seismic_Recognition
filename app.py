@@ -53,21 +53,18 @@ st.markdown("結合 **PatchTST Transformer** 與 **100s 滑動視窗** 之雲端
 
 # 波形預處理與推論函式
 def predict(raw_data):
-    # 建議：若訓練時沒有做 Bandpass 濾波，推論時也不該做！
-    # 僅做基礎 去平均 (Demean) 與 Z-Score 正規化
     wave = raw_data - np.mean(raw_data)
     std = np.std(wave)
     normalized = (wave) / std if std > 1e-6 else np.zeros_like(wave)
     
-    # 轉為 PyTorch Tensor: shape (batch_size=1, channel=1, seq_len=1600)
     input_tensor = torch.tensor(normalized, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
     
     with torch.no_grad():
-        logits = model(input_tensor)
-        # 取得機率值
-        prob = torch.sigmoid(logits).item()
-    return normalized, prob
-
+        logits = model(input_tensor) # shape: [1, 2]
+        probs = torch.softmax(logits, dim=-1)
+        prob_earthquake = probs[0, 1].item() # 取得 index 1 (地震波) 的信心度
+        
+    return normalized, prob_earthquake
 if mode == "🛰️ 即時串流監測 (Live SeedLink)":
     # 每一秒刷新一次 (1000ms)
     count = st_autorefresh(interval=2000, key="eew_refresh")

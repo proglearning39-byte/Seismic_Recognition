@@ -13,7 +13,7 @@ from seedlink_client import fetch_latest_waveform
 st.set_page_config(page_title="PatchTST EEW 地震即時預警系統", layout="wide", page_icon="🌋")
 
 # -----------------------------------------------------------------------------
-# 1. 訊號處理與防誤報演算法 (STA/LTA + 帶通濾波)
+# 1. 訊號處理與物理特徵演算法
 # -----------------------------------------------------------------------------
 
 def bandpass_filter(data, lowcut=1.0, highcut=20.0, fs=100.0, order=4):
@@ -33,14 +33,27 @@ def calc_sta_lta(data, sta_len=50, lta_len=500):
     - lta_len=500 (5.0秒)
     """
     data_sq = data ** 2
-    # 近期短時間能量
     sta = np.mean(data_sq[-sta_len:])
-    # 長時間背景能量
     lta = np.mean(data_sq[-lta_len:])
     
     if lta < 1e-8:
         return 0.0
     return sta / lta
+
+def is_waveform_valid(data, min_len=1600, max_zero_ratio=0.05):
+    """
+    🛡️ 防線 0：檢查緩衝區資料是否完整 (防止 SeedLink 斷線/清空導致半邊補 0 的階梯偽影)
+    """
+    if data is None or len(data) < min_len:
+        return False
+    
+    window = np.array(data[-min_len:])
+    # 計算全零或極微小值的比例
+    zero_count = np.sum(np.abs(window) < 1e-6)
+    if (zero_count / min_len) > max_zero_ratio:
+        return False
+        
+    return True
 
 @st.cache_resource
 def load_model():
@@ -82,10 +95,10 @@ if "consecutive_triggers" not in st.session_state:
 
 # UI 主標題
 st.title("🌋 Seismic PatchTST 秒級即時預警系統")
-st.markdown("結合 **PatchTST Transformer** 與 **STA/LTA 混合觸發 (Hybrid Trigger)** 之即時預警服務。")
+st.markdown("結合 **PatchTST Transformer** 與 **STA/LTA 雙重物理驗證** 之即時預警服務。")
 
 # -----------------------------------------------------------------------------
-# 3. 波形推論核心函數 (含雙重物理防線)
+# 3. 波形推論核心函數 (含多重物理防衛)
 # -----------------------------------------------------------------------------
 
 def predict(raw_data, model_inst):
@@ -102,12 +115,12 @@ def predict(raw_data, model_inst):
     normalized = wave / std if std > 1e-6 else np.zeros_like(wave)
     
     # -------------------------------------------------------------------------
-    # 🛡️ 防線 1：絕對能量硬過濾 (當前波形全為背景平靜雜訊時，直接阻斷 AI 推論)
+    # 🛡️ 防線 1：絕對能量硬過濾 (平靜無極端能量時直接阻斷推論)
     # -------------------------------------------------------------------------
-    if raw_std < 1.0:  # 數值可依 SeedLink 測站單位調整
+    if raw_std < 0.5:  # 可依測站 Counts 單位微調
         return normalized, 0.0001, sta_lta_ratio
         
-    # D. 送入 PatchTST 模型進行深度推論
+    # D. 送入 PatchTST 模型推論
     input_tensor = torch.tensor(normalized, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
     with torch.no_grad():
         logits = model_inst(input_tensor)
@@ -127,42 +140,42 @@ if mode == "🛰️ 即時串流監測 (Live SeedLink)":
     st.subheader("🛰️ IRIS ANMO 測站實時連線中...")
     data, is_live = fetch_latest_waveform()
     
-    # 防護機制：確認 SeedLink Buffer 是否已積滿 16 秒 (1600 點)
-    if data is None or len(data) < 1600:
-        st.warning(f"⏳ 即時波形緩衝區累積中... ({len(data) if data is not None else 0} / 1600 點)，請稍候數秒以確保波形完整。")
+    # 檢查緩衝區與零值斷層
+    if not is_waveform_valid(data):
+        st.warning("⏳ 即時波形緩衝區累積/重連中... (正在確保 16 秒完整波形以防止偽影錯報)")
     else:
-        # 取最新 1600 個真實資料點，防止補零 (Zero-padding) 造成斷崖波形
         valid_data = np.array(data[-1600:])
         normalized_wave, prob, sta_lta_ratio = predict(valid_data, model)
         
         # ---------------------------------------------------------------------
-        # 🛡️ 防線 2：AI 信心度 + STA/LTA 能量突變雙重驗證 (Hybrid Triggering)
+        # 🛡️ 防線 2：AI 信心度 + STA/LTA 雙驗證 + Voting 防護
         # ---------------------------------------------------------------------
         is_hybrid_triggered = (prob >= threshold) and (sta_lta_ratio >= sta_lta_threshold)
         
         if is_hybrid_triggered:
             st.session_state.consecutive_triggers += 1
         else:
-            st.session_state.consecutive_triggers = max(0, st.session_state.consecutive_triggers - 1)
+            # 關鍵修正：當非觸發狀態時【歸零】，徹底解決 169/3 警報卡死問題！
+            st.session_state.consecutive_triggers = 0
             
         is_alarm = st.session_state.consecutive_triggers >= 3
         
         # 關鍵指標卡片
         col1, col2, col3, col4 = st.columns(4)
-        col1.metric("模型地震信心度", f"{prob*100:.2f}%")
+        col1.metric("當前模型地震信心度", f"{prob*100:.2f}%")
         col2.metric("STA/LTA 突變比", f"{sta_lta_ratio:.2f}", delta="觸發門檻 ≥ " + str(sta_lta_threshold))
         col3.metric("時間一致性 (Voting)", f"{st.session_state.consecutive_triggers}/3")
         col4.metric("連線狀態", "🟢 Live" if is_live else "🟡 Fallback (Simulated)")
         
-        # 警報橫幅
+        # 警報橫幅判定
         if is_alarm:
-            st.error(f"🚨 [EARTHQUAKE WARNING] 雙驗證偵測到地震 P 波衝擊！信心度: {prob*100:.2f}%, STA/LTA: {sta_lta_ratio:.2f}")
+            st.error(f"🚨 [EARTHQUAKE WARNING] 雙驗證觸發警報！信心度: {prob*100:.2f}%, STA/LTA: {sta_lta_ratio:.2f}")
         elif prob >= threshold and sta_lta_ratio < sta_lta_threshold:
-            st.warning(f"⚠️ [雜訊過濾] AI 判斷概率高 ({prob*100:.2f}%)，但無物理能量突變 (STA/LTA: {sta_lta_ratio:.2f}) -> 認定為放大雜訊！")
+            st.warning(f"⚠️ [雜訊過濾] AI 信心度偏高 ({prob*100:.2f}%)，但無物理能量突變 (STA/LTA: {sta_lta_ratio:.2f}) -> 判定為放大雜訊！")
         else:
             st.success("🟢 系統監測中：未偵測到地震特徵")
             
-        # 繪製 Matplotlib 即時波形 (將 X 軸轉為 0~16 秒)
+        # 繪製波形圖 (X 軸為 0~16 秒)
         time_axis = np.linspace(0, 16, 1600)
         fig, ax = plt.subplots(figsize=(10, 3))
         ax.plot(time_axis, normalized_wave, color='crimson' if is_alarm else '#1f77b4', lw=1.0)

@@ -1,196 +1,138 @@
 import os
-import matplotlib.pyplot as plt
-import numpy as np
-import obspy
-from obspy.clients.fdsn import Client
-import streamlit as st
 import torch
+import numpy as np
+import matplotlib.pyplot as plt
+import gradio as gr
+from obspy import read
+from model_architecture import PatchTSTEEWRobust
 
-from model_architecture import build_patchtst_eew_model
+# ---------------------------------------------------------
+# 1. 模型載入與設定
+# ---------------------------------------------------------
+MODEL_PATH = "patchtst_eew_robust_best/data.pkl"  # 您的權重路徑
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# 頁面標題與佈局設定
-st.set_page_config(
-    page_title="PatchTST 秒級地震預警監控系統", page_icon="🌋", layout="wide"
-)
-
-# 1. 載入模型 (使用 Streamlit 快取避免重複載入)
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "patchtst_eew_robust_best.pt")
-device = "cuda" if torch.cuda.is_available() else "cpu"
-
-
-@st.cache_resource
-def load_model():
-    model = build_patchtst_eew_model(device)
+def load_eew_model():
+    model = PatchTSTEEWRobust()
     if os.path.exists(MODEL_PATH):
-        model.load_state_dict(
-            torch.load(MODEL_PATH, map_location=device, weights_only=True)
-        )
-        model.eval()
+        try:
+            state_dict = torch.load(MODEL_PATH, map_location=DEVICE)
+            model.load_state_dict(state_dict)
+            print("Successfully loaded model weights!")
+        except Exception as e:
+            print(f"Error loading state_dict: {e}")
+    else:
+        print(f"Warning: {MODEL_PATH} not found. Running with uninitialized model.")
+    model.to(DEVICE)
+    model.eval()
     return model
 
+model = load_eew_model()
 
-try:
-    model = load_model()
-    model_loaded = True
-except Exception as e:
-    model_loaded = False
-    st.error(f"模型載入失敗，將採用標準預警演算機制模擬。錯誤訊息: {e}")
+# ---------------------------------------------------------
+# 2. 波形推論核心邏輯
+# ---------------------------------------------------------
+def process_seismic_signal(file_obj, patch_length_sec=0.5, sampling_rate=100.0):
+    """
+    處理上傳的波形檔案，進行波形預處理、PatchTST 模型推論與數據繪製
+    """
+    if file_obj is None:
+        return "請上傳 MSEED / SAC 地震檔案", None, None
 
-# 2. 側邊欄控制台
-st.sidebar.title("🌋 預警系統控制台")
-station_code = st.sidebar.text_input("監控測站代碼", "IU.ANMO.00.BHZ")
-scenario = st.sidebar.radio(
-    "模擬情境選擇",
-    [
-        "常態背景雜訊 (Background Noise)",
-        "P 波波形動態注入測試 (P-Wave Injection)",
-    ],
-)
+    try:
+        # 讀取地震波形
+        st = read(file_obj.name)
+        st.filter('bandpass', freqmin=1.0, freqmax=20.0) # 標準 1-20Hz 帶通濾波器
+        tr = st[0]
+        data = tr.data.astype(np.float32)
 
-# AI 護欄動態調參
-st.sidebar.subheader("🛡️ 護欄機制 (Persistence Guardrail)")
-threshold = st.sidebar.slider("預警機率門檻 (Threshold)", 0.50, 0.99, 0.85)
-persistence = st.sidebar.slider("連續確認幀數 (Confirmation Frames)", 1, 5, 3)
+        # 標準化 (Z-score Normalization)
+        data = (data - np.mean(data)) / (np.std(data) + 1e-6)
 
-run_btn = st.sidebar.button("啟動串流推論監控", type="primary")
+        # 自動裁切/補齊至模型預期的輸入長度（例如 1600 個採樣點 = 16 秒）
+        target_length = 1600 
+        if len(data) > target_length:
+            # 擷取波形前半段或前 16 秒
+            input_data = data[:target_length]
+        else:
+            # Padding 補零
+            input_data = np.pad(data, (0, target_length - len(data)), 'constant')
 
-# 3. 主畫面展示
-st.title("🌋 PatchTST 秒級地震預警與抗噪即時監控系統")
-st.caption(
-    "基於 PatchTST (0.5s Patch Length) Transformer 結合因果截斷 (Causal Truncation) 與時間連續性護欄。"
-)
+        tensor_input = torch.tensor(input_data).unsqueeze(0).to(DEVICE)
 
-if run_btn:
-    with st.spinner("正在接收 100Hz 即時波形數據並進行滑動視窗推論..."):
-        np.random.seed(42)
-        # 產生 60 秒 (6000 點) 背景波形
-        stream_data = np.random.normal(0, 0.5, 6000).astype(np.float32)
+        # 模型推論 (Inference)
+        with torch.no_grad():
+            logits = model(tensor_input)
+            prob = torch.sigmoid(logits).item()
 
-        # 注入測試波形
-        if "P 波" in scenario:
-            try:
-                client = Client("IRIS")
-                t_eq = obspy.UTCDateTime("2023-02-06T01:25:00")
-                st_eq = client.get_waveforms(
-                    "IU", "ANMO", "00", "BHZ", t_eq, t_eq + 60
-                )
-                st_eq.filter("bandpass", freqmin=1.0, freqmax=45.0)
-                real_p = st_eq[0].data[:2000].astype(np.float32)
-            except Exception:
-                t_p = np.linspace(0, 20, 2000)
-                real_p = (
-                    np.sin(2 * np.pi * 15.0 * t_p) * np.exp(-0.15 * t_p) * 8.0
-                ).astype(np.float32)
+        # 警報判定 (Threshold = 0.5)
+        is_earthquake = prob >= 0.5
+        status_color = "🔴 【強烈地震預警！】" if is_earthquake else "🟢 【安全：背景雜訊 / 無震波】"
+        confidence_text = f"地震事件信心度 (Earthquake Probability): {prob * 100:.2f}%"
 
-            stream_data[2500:4500] += real_p * 0.8
+        # 繪製波形與二元預警檢測圖表
+        fig, ax = plt.subplots(figsize=(10, 3.5), dpi=150)
+        time_axis = np.arange(len(input_data)) / sampling_rate
+        ax.plot(time_axis, input_data, color='#1f77b4', linewidth=1.0, label="Filtered Seismic Velocity")
+        
+        if is_earthquake:
+            ax.set_facecolor('#fff0f0') # 發生地震時顯示紅底警示區域
+            ax.axvspan(0, time_axis[-1], color='red', alpha=0.15, label="Earthquake Triggered")
+        else:
+            ax.set_facecolor('#f4fbf4')
 
-        # 滑動視窗推論 (2000 點 / 20 秒視窗，步幅 100 點 / 1 秒)
-        window_size = 2000
-        probs = []
-
-        for i in range(0, len(stream_data) - window_size, 100):
-            win = stream_data[i : i + window_size]
-
-            if model_loaded:
-                win_norm = (win - np.mean(win)) / (np.std(win) + 1e-6)
-                inp = (
-                    torch.tensor(win_norm, dtype=torch.float32)
-                    .unsqueeze(0)
-                    .unsqueeze(-1)
-                    .to(device)
-                )
-                with torch.no_grad():
-                    p = torch.softmax(
-                        model(past_values=inp).prediction_logits, dim=-1
-                    )[0][1].item()
-            else:
-                tail_energy = np.std(win[-50:])
-                if "P 波" in scenario and i >= 500:
-                    p = float(
-                        1.0 / (1.0 + np.exp(-10 * (tail_energy - 1.2)))
-                    )
-                else:
-                    p = 0.0001
-            probs.append(p)
-
-        # 護欄連續性判決
-        consecutive = 0
-        alerts = []
-        for p in probs:
-            if p >= threshold:
-                consecutive += 1
-            else:
-                consecutive = 0
-            alerts.append(consecutive >= persistence)
-
-        # 4. 繪製雙圖表
-        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(11, 5.5), sharex=True)
-        time_axis = np.linspace(20, 60, 4000)
-
-        # 上圖：即時波形
-        ax1.plot(time_axis, stream_data[2000:], color="#1f77b4", lw=1)
-        ax1.set_ylabel("Amplitude")
-        ax1.set_title(
-            f"Station: {station_code} - Waveform Buffer (20s - 60s)",
-            fontsize=11,
-        )
-        ax1.grid(True, linestyle="--", alpha=0.5)
-
-        # 下圖：預警機率與警報觸發區間
-        prob_time = np.linspace(20, 60, len(probs))
-        ax2.plot(
-            prob_time,
-            probs,
-            color="#d62728",
-            lw=2,
-            label="P-Wave Probability",
-        )
-        ax2.axhline(
-            threshold,
-            color="gray",
-            linestyle=":",
-            label=f"Guardrail Threshold ({threshold})",
-        )
-
-        alert_times = [
-            prob_time[idx] for idx, is_act in enumerate(alerts) if is_act
-        ]
-        if alert_times:
-            ax2.axvspan(
-                alert_times[0],
-                alert_times[-1],
-                color="red",
-                alpha=0.2,
-                label="🚨 Alert Triggered Zone",
-            )
-
-        ax2.set_ylabel("Probability")
-        ax2.set_xlabel("Timeline (Seconds)")
-        ax2.set_ylim(-0.05, 1.05)
-        ax2.grid(True, linestyle="--", alpha=0.5)
-        ax2.legend(loc="upper left")
-
+        ax.set_title(f"Seismic Waveform Analysis | Prediction: {'EARTHQUAKE' if is_earthquake else 'NOISE'}", fontsize=12, fontweight='bold')
+        ax.set_xlabel("Time (seconds)", fontsize=10)
+        ax.set_ylabel("Normalized Amplitude", fontsize=10)
+        ax.legend(loc="upper right")
+        ax.grid(True, linestyle="--", alpha=0.5)
         plt.tight_layout()
 
-        # 5. 結果呈現
-        col1, col2 = st.columns([1, 2.5])
-        with col1:
-            if any(alerts):
-                st.error(
-                    f"🚨 **[ALERT]** 於 **{alert_times[0]:.1f} 秒** 觸發 P 波秒級預警！\n\n(通過連續 {persistence} 幀門檻確認，成功扣除偽陽性)"
-                )
-            else:
-                st.success(
-                    "🟢 **[NORMAL]** 常態背景雜訊過濾中，系統保持靜默。"
-                )
+        return status_color, confidence_text, fig
 
-            st.metric("當前監控測站", station_code)
-            st.metric(
-                "最高預警機率",
-                f"{max(probs):.4f}",
-                delta="超過門檻" if max(probs) >= threshold else "正常範圍",
+    except Exception as e:
+        return f"波形解析失敗: {str(e)}", "", None
+
+# ---------------------------------------------------------
+# 3. Gradio 介面搭建 (UI Interface)
+# ---------------------------------------------------------
+custom_css = """
+#alert-box { font-size: 20px; font-weight: bold; text-align: center; }
+#conf-box { font-size: 16px; text-align: center; }
+"""
+
+with gr.Blocks(css=custom_css, title="Seismic PatchTST Real-time Early Warning") as demo:
+    gr.Markdown(
+        """
+        # 🌋 地震深度學習即時預警系統 (PatchTST EEW System)
+        **AI 驅動秒級地震波分類與 P 波微觀脈衝識別**
+        """
+    )
+    
+    with gr.Row():
+        with gr.Column(scale=1):
+            file_input = gr.File(label="上傳地震資料檔 (.mseed, .sac, .miniseed)", file_types=[".mseed", ".sac", ".miniseed"])
+            submit_btn = gr.Button("🚨 執行波形檢測與推論", variant="primary")
+            
+            gr.Markdown(
+                """
+                ---
+                ### 💡 專案說明與特點
+                1. **PatchTST 時序架構**：將時域連續波形進行 Patch 化，精準掌握 P 波初動特徵。
+                2. **因果防禦機制**：針對 P 波抵達後 0.5~3 秒極短視窗進行微觀動態訓練。
+                """
             )
+            
+        with gr.Column(scale=2):
+            status_output = gr.Textbox(label="系統即時狀態 (Status)", elem_id="alert-box")
+            confidence_output = gr.Textbox(label="AI 預測信心水準 (Confidence)", elem_id="conf-box")
+            plot_output = gr.Plot(label="測站動態時域波形圖 (Waveform Rendering)")
 
-        with col2:
-            st.pyplot(fig)
+    submit_btn.click(
+        fn=process_seismic_signal,
+        inputs=[file_input],
+        outputs=[status_output, confidence_output, plot_output]
+    )
+
+if __name__ == "__main__":
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=False)

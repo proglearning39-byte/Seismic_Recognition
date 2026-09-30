@@ -2,7 +2,7 @@ from obspy.clients.fdsn import Client
 from obspy import UTCDateTime
 import numpy as np
 
-def fetch_latest_waveform(net="IU", sta="ANMO", loc="00", cha="BHZ", duration_sec=16):
+def fetch_latest_waveform(net="IU", sta="TATO", loc="00", cha="BHZ", duration_sec=16):
     """
     透過 FDSN / SeedLink 抓取近 16 秒最新即時數據
     """

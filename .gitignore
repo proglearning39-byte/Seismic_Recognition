@@ -20,3 +20,6 @@ env/
 checkpoints/
 *.mseed
 *.sac
+
+# 強制追蹤訓練好的權重檔 (前提是檔案 < 100MB)
+!patchtst_eew_best.pt

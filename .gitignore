@@ -1,0 +1,22 @@
+# Python 快取
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Streamlit 設定
+.streamlit/
+*.log
+
+# 虛擬環境
+venv/
+env/
+.env
+
+# PyTorch Checkpoints (防止突破 GitHub 100MB 限制)
+*.pt
+*.pth
+*.pkl
+checkpoints/
+*.mseed
+*.sac

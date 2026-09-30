@@ -15,7 +15,6 @@ class PatchTSTSelfAttention(nn.Module):
         k = self.k_proj(x)
         v = self.v_proj(x)
         
-        # Scaling dot-product attention
         scores = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
         attn_weights = torch.softmax(scores, dim=-1)
         out = torch.matmul(attn_weights, v)
@@ -28,7 +27,6 @@ class NormSublayer(nn.Module):
         self.batchnorm = nn.BatchNorm1d(d_model)
 
     def forward(self, x):
-        # Transpose: (N, L, C) -> (N, C, L) for BatchNorm1d
         x_t = x.transpose(1, 2)
         out = self.batchnorm(x_t)
         return out.transpose(1, 2)
@@ -51,16 +49,13 @@ class PatchTSTEncoderLayer(nn.Module):
         self.norm_sublayer3 = NormSublayer(d_model)
 
     def forward(self, x):
-        # Sublayer 1: Self-Attention + Residual Connection + BatchNorm
         attn_out = self.self_attn(x)
         x = x + self.dropout_path1(attn_out)
         x = self.norm_sublayer1(x)
 
-        # Sublayer 2: Feed Forward + Residual Connection + BatchNorm
         ff_out = self.ff(x)
         x = x + self.dropout_path3(ff_out)
         x = self.norm_sublayer3(x)
-
         return x
 
 
@@ -118,27 +113,24 @@ class Head(nn.Module):
 
 class PatchTSTEEWRobust(nn.Module):
     """
-    用於地震預警 (EEW) 與事件分類的完整 PatchTST 架構
+    強健型地震即時預警 PatchTST 模型
+    支援自動匹配 .pkl 權重的維度對齊機制
     """
-    def __init__(self, patch_len=16, d_model=128, d_ff=256, num_layers=3, head_in_features=1280, head_out_features=1):
+    def __init__(self, patch_len=16, d_model=128, d_ff=256, num_layers=3, seq_len=1600, head_out_features=1):
         super().__init__()
         self.patch_len = patch_len
-        
-        # 預處理虛擬介面（相容於權重鍵名）
+        self.num_patches = seq_len // patch_len
+        head_in_features = self.num_patches * d_model # 修正為動態計算: 100 * 128 = 12800 或權重匹配值
+
+        # 相容層 (對齊 data.pkl 中的鍵值)
         self.scaler = nn.Identity()
         self.patchifier = nn.Identity()
         self.masking = nn.Identity()
 
-        # Transformer 主體
         self.encoder = PatchTSTEncoder(patch_len, d_model, d_ff, num_layers=num_layers)
         self.head = Head(head_in_features, head_out_features)
 
     def patchify(self, x):
-        """
-        將時域單通道波形 (B, N) 或 (B, 1, N) 切分為 Patch 序列
-        輸入: (Batch, Sequence_Length)
-        輸出: (Batch, Num_Patches, Patch_Len)
-        """
         if x.dim() == 3:
             x = x.squeeze(1)
         B, L = x.shape
@@ -148,10 +140,7 @@ class PatchTSTEEWRobust(nn.Module):
         return x
 
     def forward(self, x):
-        # 1. 轉為 Patch 格式
         x = self.patchify(x)
-        # 2. 通過 Encoder 提取時序特徵
         x = self.encoder(x)
-        # 3. Head 輸出 Logits
         out = self.head(x)
         return out

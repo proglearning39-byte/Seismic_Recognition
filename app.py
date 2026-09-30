@@ -7,7 +7,18 @@ import scipy.signal as signal
 from streamlit_autorefresh import st_autorefresh
 from model import PatchTSTEEWRobust
 from seedlink_client import fetch_latest_waveform
+from scipy.signal import butter, filtfilt
 
+# 1. 新增：1~20Hz 帶通濾波器（濾除巨大圓弧狀的低頻溫漂）
+def bandpass_filter(data, lowcut=1.0, highcut=20.0, fs=100.0, order=4):
+    nyq = 0.5 * fs
+    low = lowcut / nyq
+    high = highcut / nyq
+    b, a = butter(order, [low, high], btype='band')
+    if len(data) > 3 * order:
+        return filtfilt(b, a, data)
+    return data
+    
 # 頁面標題配置
 st.set_page_config(page_title="PatchTST EEW 地震即時預警系統", layout="wide", page_icon="🌋")
 
@@ -52,17 +63,21 @@ st.title("🌋 Seismic PatchTST 秒級即時預警系統")
 st.markdown("結合 **PatchTST Transformer** 與 **100s 滑動視窗** 之雲端即時預警服務。")
 
 # 波形預處理與推論函式
-def predict(raw_data):
-    wave = raw_data - np.mean(raw_data)
+def predict(raw_data, model):
+    # A. 先濾波，去掉 DC bias 與極低頻漂移
+    filtered_data = bandpass_filter(raw_data)
+    
+    # B. 去平均與 Z-Score 標準化
+    wave = filtered_data - np.mean(filtered_data)
     std = np.std(wave)
-    normalized = (wave) / std if std > 1e-6 else np.zeros_like(wave)
+    normalized = wave / std if std > 1e-6 else np.zeros_like(wave)
     
+    # C. 送入模型推論
     input_tensor = torch.tensor(normalized, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-    
     with torch.no_grad():
-        logits = model(input_tensor) # shape: [1, 2]
+        logits = model(input_tensor)
         probs = torch.softmax(logits, dim=-1)
-        prob_earthquake = probs[0, 1].item() # 取得 index 1 (地震波) 的信心度
+        prob_earthquake = probs[0, 1].item()
         
     return normalized, prob_earthquake
 if mode == "🛰️ 即時串流監測 (Live SeedLink)":

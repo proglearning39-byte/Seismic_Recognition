@@ -21,15 +21,14 @@ def load_model():
         st.error(f"❌ 找不到模型權重檔案: {model_path}，請確認是否已上傳至 GitHub！")
         st.stop()
         
-    try:checkpoint = torch.load(model_path, map_location="cpu")
-        
-        # 相容不同保存格式 (若為 dict 則取出 state_dict)
+    try:
+        checkpoint = torch.load(model_path, map_location="cpu")
         if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
             checkpoint = checkpoint["model_state_dict"]
             
-        # 關鍵：使用 strict=False 忽略命名差異，確保 App 順利啟動！
-        missing_keys, unexpected_keys = model.load_state_dict(checkpoint, strict=False)
-        print("✅ 成功以容錯模式載入模型！")
+        # 進行嚴格載入
+        model.load_state_dict(checkpoint, strict=True)
+        print("🎉 恭喜！模型權重 100% 精準匹配成功！")
     except Exception as e:
         st.error(f"❌ 模型權重載入失敗: {e}")
         st.stop()
